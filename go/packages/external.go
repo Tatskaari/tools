@@ -42,11 +42,54 @@ type driverRequest struct {
 	Overlay map[string][]byte `json:"overlay"`
 }
 
+type BinaryDriver struct {
+	ToolPath string
+}
+
+func (b *BinaryDriver) Resolve(cfg *Config, patterns ...string) (*DriverResponse, error) {
+	req, err := json.Marshal(driverRequest{
+		Mode:       cfg.Mode,
+		Env:        cfg.Env,
+		BuildFlags: cfg.BuildFlags,
+		Tests:      cfg.Tests,
+		Overlay:    cfg.Overlay,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to encode message to driver tool: %v", err)
+	}
+
+	buf := new(bytes.Buffer)
+	stderr := new(bytes.Buffer)
+	cmd := exec.CommandContext(cfg.Context, b.ToolPath, patterns...)
+	cmd.Dir = cfg.Dir
+	cmd.Env = cfg.Env
+	cmd.Stdin = bytes.NewReader(req)
+	cmd.Stdout = buf
+	cmd.Stderr = stderr
+
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("%v: %v: %s", b.ToolPath, err, cmd.Stderr)
+	}
+	if len(stderr.Bytes()) != 0 && os.Getenv("GOPACKAGESPRINTDRIVERERRORS") != "" {
+		fmt.Fprintf(os.Stderr, "%s stderr: <<%s>>\n", cmdDebugStr(cmd), stderr)
+	}
+
+	var response DriverResponse
+	if err := json.Unmarshal(buf.Bytes(), &response); err != nil {
+		return nil, err
+	}
+	return &response, nil
+}
+
 // findExternalDriver returns the file path of a tool that supplies
 // the build system package structure, or "" if not found."
 // If GOPACKAGESDRIVER is set in the environment findExternalTool returns its
 // value, otherwise it searches for a binary named gopackagesdriver on the PATH.
-func findExternalDriver(cfg *Config) driver {
+func findExternalDriver(cfg *Config) Driver {
+	if cfg.Driver != nil {
+		return cfg.Driver
+	}
+
 	const toolPrefix = "GOPACKAGESDRIVER="
 	tool := ""
 	for _, env := range cfg.Env {
@@ -54,7 +97,7 @@ func findExternalDriver(cfg *Config) driver {
 			tool = val
 		}
 	}
-	if tool != "" && tool == "off" {
+	if tool == "off" {
 		return nil
 	}
 	if tool == "" {
@@ -64,38 +107,5 @@ func findExternalDriver(cfg *Config) driver {
 			return nil
 		}
 	}
-	return func(cfg *Config, words ...string) (*driverResponse, error) {
-		req, err := json.Marshal(driverRequest{
-			Mode:       cfg.Mode,
-			Env:        cfg.Env,
-			BuildFlags: cfg.BuildFlags,
-			Tests:      cfg.Tests,
-			Overlay:    cfg.Overlay,
-		})
-		if err != nil {
-			return nil, fmt.Errorf("failed to encode message to driver tool: %v", err)
-		}
-
-		buf := new(bytes.Buffer)
-		stderr := new(bytes.Buffer)
-		cmd := exec.CommandContext(cfg.Context, tool, words...)
-		cmd.Dir = cfg.Dir
-		cmd.Env = cfg.Env
-		cmd.Stdin = bytes.NewReader(req)
-		cmd.Stdout = buf
-		cmd.Stderr = stderr
-
-		if err := cmd.Run(); err != nil {
-			return nil, fmt.Errorf("%v: %v: %s", tool, err, cmd.Stderr)
-		}
-		if len(stderr.Bytes()) != 0 && os.Getenv("GOPACKAGESPRINTDRIVERERRORS") != "" {
-			fmt.Fprintf(os.Stderr, "%s stderr: <<%s>>\n", cmdDebugStr(cmd), stderr)
-		}
-
-		var response driverResponse
-		if err := json.Unmarshal(buf.Bytes(), &response); err != nil {
-			return nil, err
-		}
-		return &response, nil
-	}
+	return &BinaryDriver{ToolPath: tool}
 }
